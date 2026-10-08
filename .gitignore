@@ -1,0 +1,43 @@
+# ─── Secrets ──────────────────────────────────────────────────────────────────
+# Per-node swarm HMAC keys must never be committed. The client refuses to start
+# with an empty key, because an empty key still yields a valid HMAC that anyone
+# could forge.
+.env
+.env.*
+!.env.example
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+
+.venv/
+venv/
+env/
+ENV/
+
+build/
+dist/
+*.egg-info/
+
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ─── Runtime telemetry and lab scratch files ──────────────────────────────────
+# alert_live.json is written by defender_engine/log_sentinel.py at runtime.
+# The committed sample_alerts.json is deliberately NOT ignored: it is the
+# documented SIEM schema fixture.
+telemetry_siem/alert_live.json
+telemetry_siem/sample_alerts.jsonl
+*.log
+auth.log
+
+# ─── Local editor / OS ────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

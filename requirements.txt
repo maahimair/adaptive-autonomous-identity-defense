@@ -1,0 +1,13 @@
+# AAIDD runtime dependencies.
+#
+# The defender, deception and swarm modules run on the standard library alone.
+# These are only needed for the lab-only attack simulator and for live swarm
+# transmission.
+
+# Lab attack simulator (attacker_engine/auth_flood.py).
+# Bounded as <4.0 to stay on the pre-4.0 API surface the simulator targets.
+paramiko>=3.4,<4.0
+
+# Live threat-swarm transmission (threat_swarm/swarm_sync.py).
+# dry_run mode works without it.
+requests>=2.31
