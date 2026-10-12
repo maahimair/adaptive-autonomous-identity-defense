@@ -5,7 +5,10 @@
 
 import json
 import os
+import shutil
 import sys
+import threading
+import time
 
 import pytest
 
@@ -16,7 +19,10 @@ for module_dir in ("defender_engine", "deception_tarpit", "threat_swarm"):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from log_sentinel import LogInterceptorSentinel            # noqa: E402
+from log_sentinel import (                                  # noqa: E402
+    HEAD_FINGERPRINT_BYTES,
+    LogInterceptorSentinel,
+)
 from mock_shell import AdaptiveDeceptionTarpit            # noqa: E402
 from swarm_sync import ThreatSwarmSyncClient              # noqa: E402
 
@@ -28,6 +34,13 @@ AUTH_LOG_LINE = (
 INVALID_USER_LINE = (
     "Jun 15 12:00:03 prod-db sshd[1102]: Failed password for invalid user admin "
     "from 198.51.100.42 port 41235 ssh2"
+)
+
+#: Pre-existing, benign log content used to start the tailing tests. Long
+#: enough that the head fingerprint is a complete prefix.
+SETTLED_LOG = "".join(
+    f"Jun 15 11:{minute:02d}:00 prod-db sshd[1]: Accepted password for deploy\n"
+    for minute in range(10)
 )
 
 
@@ -159,6 +172,180 @@ def test_sanitises_hostile_username(sentinel, tmp_path):
     alert = read_alerts(str(tmp_path / "alerts.json"))[0]
     user = alert["indicators"]["targeted_identity"]
     assert set(user) <= set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.")
+
+
+# ─── Telemetry persistence ────────────────────────────────────────────────────
+
+def test_alert_write_creates_missing_directory(tmp_path):
+    """The output directory must be created; open(..., "a") does not do it."""
+    log_file = tmp_path / "auth.log"
+    log_file.write_text("", encoding="utf-8")
+    nested = tmp_path / "fresh" / "nested" / "alerts.json"
+    engine = LogInterceptorSentinel(str(log_file), str(nested))
+
+    for _ in range(3):
+        engine.process_log_entry(AUTH_LOG_LINE)
+
+    assert nested.exists()
+    assert len(read_alerts(str(nested))) == 1
+
+
+def test_failed_alert_write_does_not_mark_source_alerted(tmp_path):
+    """A persist that fails must not burn the dedup flag.
+
+    Marking the source alerted before confirming the write made a failed
+    write a permanent suppression: the alert was announced on the console,
+    stored nowhere, and never retried for the life of the process.
+    """
+    log_file = tmp_path / "auth.log"
+    log_file.write_text("", encoding="utf-8")
+
+    # A regular file where a directory is required, so the write cannot succeed.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    engine = LogInterceptorSentinel(str(log_file), str(blocker / "alerts.json"))
+
+    for _ in range(3):
+        engine.process_log_entry(AUTH_LOG_LINE)
+
+    assert "198.51.100.42" not in engine.alerted_ips
+
+
+def test_write_to_siem_buffer_reports_success(tmp_path):
+    log_file = tmp_path / "auth.log"
+    log_file.write_text("", encoding="utf-8")
+    target = tmp_path / "out" / "alerts.json"
+    engine = LogInterceptorSentinel(str(log_file), str(target))
+
+    assert engine.write_to_siem_buffer({"event_id": "X"}) is True
+
+    blocker = tmp_path / "blocker2"
+    blocker.write_text("not a directory", encoding="utf-8")
+    broken = LogInterceptorSentinel(str(log_file), str(blocker / "alerts.json"))
+    assert broken.write_to_siem_buffer({"event_id": "X"}) is False
+
+
+# ─── Log rotation and truncation ──────────────────────────────────────────────
+
+def _wait_for(predicate, timeout=6.0, interval=0.05):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
+
+
+@pytest.mark.parametrize("regrow_delay", [0.0, 0.15])
+def test_copytruncate_rotation_still_alerts(tmp_path, regrow_delay):
+    """`copytruncate` keeps the inode, so the rotation branch never fires.
+
+    Without truncation handling the read offset stays past the new end of
+    file and every attack line written after a logrotate cycle goes unseen
+    for the remaining lifetime of the process. Both timings are covered: a
+    delay lets a size comparison catch it, no delay requires noticing that
+    the bytes at offset 0 changed.
+    """
+    log_file = tmp_path / "auth.log"
+    # A realistic starting size. The head-fingerprint signal needs more bytes
+    # than HEAD_FINGERPRINT_BYTES to be a complete prefix, and a real auth.log
+    # is never shorter than that.
+    log_file.write_text(SETTLED_LOG, encoding="utf-8")
+    alerts = tmp_path / "alerts.json"
+
+    engine = LogInterceptorSentinel(str(log_file), str(alerts))
+    worker = threading.Thread(
+        target=engine.start_tail_interceptor, kwargs={"poll_interval": 0.02}, daemon=True
+    )
+    worker.start()
+    time.sleep(0.4)
+
+    inode_before = os.stat(log_file).st_ino
+
+    # logrotate's copytruncate: copy the file away, then empty it in place.
+    shutil.copyfile(str(log_file), str(tmp_path / "auth.log.1"))
+    log_file.write_text("", encoding="utf-8")
+    assert os.stat(log_file).st_ino == inode_before, "copytruncate must preserve the inode"
+
+    time.sleep(regrow_delay)
+    for i in range(3):
+        with open(log_file, "a", encoding="utf-8") as handle:
+            handle.write(AUTH_LOG_LINE + "\n")
+        time.sleep(0.2)
+
+    assert _wait_for(lambda: alerts.exists()), "no alert raised after copytruncate"
+    alerts_written = read_alerts(str(alerts))
+    assert len(alerts_written) == 1
+    assert alerts_written[0]["indicators"]["attacker_ip"] == "198.51.100.42"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "Windows refuses to rename or replace a file that is open, and the "
+        "tailer holds the log open by design. This covers the rename-style "
+        "rotation path, which copytruncate does not exercise."
+    ),
+)
+def test_tail_loop_follows_a_renamed_rotation(tmp_path):
+    """The rename-style rotation path must keep working."""
+    log_file = tmp_path / "auth.log"
+    log_file.write_text(SETTLED_LOG, encoding="utf-8")
+    alerts = tmp_path / "alerts.json"
+
+    engine = LogInterceptorSentinel(str(log_file), str(alerts))
+    threading.Thread(
+        target=engine.start_tail_interceptor, kwargs={"poll_interval": 0.02}, daemon=True
+    ).start()
+    time.sleep(0.4)
+
+    os.rename(str(log_file), str(tmp_path / "auth.log.1"))
+    log_file.write_text("Jun 15 12:00:00 host sshd[1]: fresh file\n", encoding="utf-8")
+
+    for _ in range(3):
+        with open(log_file, "a", encoding="utf-8") as handle:
+            handle.write(AUTH_LOG_LINE + "\n")
+        time.sleep(0.2)
+
+    assert _wait_for(lambda: alerts.exists())
+    assert len(read_alerts(str(alerts))) == 1
+
+
+def test_head_fingerprint_reads_the_head_without_moving_the_read_offset(tmp_path):
+    """Probing the head must not disturb the tailer's own file position."""
+    log_file = tmp_path / "auth.log"
+    log_file.write_text("head bytes\n", encoding="utf-8")
+    engine = LogInterceptorSentinel(str(log_file), str(tmp_path / "alerts.json"))
+
+    first = engine._head_fingerprint()
+    assert first
+    assert first == engine._head_fingerprint(), "fingerprint is not stable across calls"
+
+    with open(log_file, "a", encoding="utf-8") as handle:
+        handle.write("plus more\n")
+    assert engine._head_fingerprint() != first, "a grown short file yields new bytes"
+
+
+def test_head_fingerprint_is_complete_past_the_sample_window(tmp_path):
+    """On a file larger than the sample window, an append must be
+    indistinguishable from no change at all - that is what lets the tailer
+    tell an in-place rewrite apart from ordinary growth.
+    """
+    log_file = tmp_path / "auth.log"
+    filler = "Jun 15 11:00:00 host sshd[1]: Accepted password for auser\n"
+    log_file.write_text(filler * 4, encoding="utf-8")
+    assert len(filler) * 4 > HEAD_FINGERPRINT_BYTES
+
+    engine = LogInterceptorSentinel(str(log_file), str(tmp_path / "alerts.json"))
+    first = engine._head_fingerprint()
+    assert len(first) == HEAD_FINGERPRINT_BYTES
+
+    with open(log_file, "a", encoding="utf-8") as handle:
+        handle.write(filler)
+    assert engine._head_fingerprint() == first, "an append must not look like a rewrite"
+
+    log_file.write_text("Sep 01 09:00:00 totally different content here\n", encoding="utf-8")
+    assert engine._head_fingerprint() != first, "a rewrite must change the fingerprint"
 
 
 # ─── Deception tarpit ─────────────────────────────────────────────────────────

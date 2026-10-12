@@ -5,6 +5,10 @@ import json
 import time
 from typing import Dict, Any
 
+# How much of the head of the log is sampled to notice an in-place rewrite.
+# One auth.log line is comfortably longer than this.
+HEAD_FINGERPRINT_BYTES = 64
+
 class LogInterceptorSentinel:
     def __init__(self, target_log_path: str, output_json_path: str,
                  threshold_limit: int = 3, window_seconds: float = 10.0):
@@ -75,15 +79,26 @@ class LogInterceptorSentinel:
         retained = self.ip_state_history[sanitized_ip]
         if len(retained) < self.threshold_limit:
             # The burst subsided below the threshold, so re-arm the alert for
-            # this source. A sustained attack must keep generating findings.
+            # this source.
             self.alerted_ips.discard(sanitized_ip)
         elif sanitized_ip not in self.alerted_ips:
             # Dedup: one burst raises one alert, not one per line.
-            self.alerted_ips.add(sanitized_ip)
-            self.raise_anomaly_alert(sanitized_ip, sanitized_user, timestamp)
+            #
+            # The dedup flag is committed only once the alert has actually
+            # been persisted. Marking it first would make a failed write a
+            # permanent suppression - the alert would be announced to the
+            # console, stored nowhere, and never retried. That is a fail-open
+            # telemetry pipeline, which is the worst failure mode for a
+            # collector feeding a SIEM.
+            if self.raise_anomaly_alert(sanitized_ip, sanitized_user, timestamp):
+                self.alerted_ips.add(sanitized_ip)
 
-    def raise_anomaly_alert(self, ip: str, user: str, log_time: str) -> None:
-        """Generates schema normalized JSON alert entities ready for direct enterprise SIEM extraction."""
+    def raise_anomaly_alert(self, ip: str, user: str, log_time: str) -> bool:
+        """Generates schema normalized JSON alert entities ready for direct enterprise SIEM extraction.
+
+        Returns True only when the alert reached storage, so the caller knows
+        whether it is safe to mark this source as already-alerted.
+        """
         alert_payload: Dict[str, Any] = {
             "event_id": "AAIDD-IDENTITY-ANOMALY-01",
             "alert_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -97,74 +112,146 @@ class LogInterceptorSentinel:
                 "classification": "Distributed Authentication Velocity Exploit"
             }
         }
-        
-        print(f"[CRITICAL ALERT] Behavioral Threshold Crossed by Source footprint: {ip}")
-        self.write_to_siem_buffer(alert_payload)
 
-    def write_to_siem_buffer(self, payload: Dict[str, Any]) -> None:
-        """Appends telemetry metadata to output storage safely using continuous verification loops."""
+        print(f"[CRITICAL ALERT] Behavioral Threshold Crossed by Source footprint: {ip}")
+        return self.write_to_siem_buffer(alert_payload)
+
+    def write_to_siem_buffer(self, payload: Dict[str, Any]) -> bool:
+        """Appends telemetry metadata to output storage, reporting whether it landed."""
         try:
+            # open(..., "a") does not create intermediate directories, so a
+            # first run against a fresh checkout would fail on a missing
+            # telemetry_siem/ and silently drop every alert.
+            parent = os.path.dirname(self.output_json_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(self.output_json_path, "a", encoding="utf-8") as json_out:
                 json_out.write(json.dumps(payload) + "\n")
-        except IOError as error:
+            return True
+        except OSError as error:
             print(f"[!] Storage Write Failure: Unable to preserve security telemetry log event: {error}", file=sys.stderr)
+            return False
 
     def start_tail_interceptor(self, poll_interval: float = 0.1) -> None:
         """Main active event loop executing real-time ingestion monitoring."""
         print(f"[*] Interceptor Core Active. Monitoring target: {self.target_log_path}")
 
+        # The handle is managed explicitly rather than with `with`: on rotation
+        # we rebind the local name to a fresh handle, and `with` closes the
+        # object captured at entry, which would leak the replacement.
+        log_file = open(self.target_log_path, "r", encoding="utf-8", errors="ignore")
         try:
-            with open(self.target_log_path, "r", encoding="utf-8", errors="ignore") as log_file:
-                # Seek to end to monitor live events exclusively
-                log_file.seek(0, 2)
+            # Seek to end to monitor live events exclusively
+            log_file.seek(0, 2)
 
-                # Holds a trailing fragment that has no newline yet. Without
-                # this buffer, a line still being written would be parsed as a
-                # short (and usually unmatched) fragment and then discarded.
-                buffer = ""
+            # Holds a trailing fragment that has no newline yet. Without
+            # this buffer, a line still being written would be parsed as a
+            # short (and usually unmatched) fragment and then discarded.
+            buffer = ""
 
-                # Identity of the file we are following, used to detect rotation.
-                inode = self._current_inode()
+            # Identity of the file we are following, used to detect rotation.
+            inode = self._current_inode()
+            # Snapshot of the bytes at offset 0, used to notice an in-place
+            # rewrite. See the truncation check below.
+            head = self._head_fingerprint()
 
-                while True:
-                    line = log_file.readline()
+            while True:
+                if self._current_inode() != inode:
+                    print("[*] Log rotation detected; reopening target.")
+                    log_file.close()
+                    log_file = open(
+                        self.target_log_path, "r",
+                        encoding="utf-8", errors="ignore",
+                    )
+                    inode = self._current_inode()
+                    head = self._head_fingerprint()
+                    buffer = ""
 
-                    if not line:
-                        # No new data. Check for rotation before sleeping.
-                        if self._current_inode() != inode:
-                            print("[*] Log rotation detected; reopening target.")
-                            log_file.close()
-                            log_file = open(
-                                self.target_log_path, "r",
-                                encoding="utf-8", errors="ignore",
-                            )
-                            inode = self._current_inode()
-                            buffer = ""
-                        time.sleep(poll_interval)
-                        continue
+                # `copytruncate` - the default for many logrotate configs -
+                # empties the file in place, so the inode does NOT change and
+                # the rotation check above never fires. Two independent signals
+                # catch it:
+                #
+                #   1. The bytes at offset 0 changed. This holds even when new
+                #      lines are appended fast enough to push the file back past
+                #      our old read offset before the next poll, which is the
+                #      case a size comparison alone would miss.
+                #   2. The file is shorter than our read offset, which catches a
+                #      truncation we did observe.
+                #
+                # Without this, every attack line written after a rotation goes
+                # unseen for the remaining lifetime of the process.
+                new_head = self._head_fingerprint()
+                truncated = False
 
-                    if not line.endswith("\n"):
-                        # Incomplete write: keep it and wait for the terminator.
-                        buffer += line
-                        continue
+                # Only compare when both fingerprints are full length. On a file
+                # shorter than the sample window the fingerprint is the whole
+                # file, so an ordinary append would look like a rewrite and
+                # would rewind the tailer on every single line.
+                complete = (
+                    new_head is not None and head is not None
+                    and len(new_head) == HEAD_FINGERPRINT_BYTES
+                    and len(head) == HEAD_FINGERPRINT_BYTES
+                )
+                if complete and new_head != head:
+                    truncated = True
+                elif new_head is not None and log_file.tell() > self._current_size():
+                    truncated = True
 
-                    if buffer:
-                        line = buffer + line
-                        buffer = ""
+                if truncated:
+                    print("[*] Log truncation detected; rewinding to start.")
+                    log_file.seek(0)
+                    buffer = ""
+                head = new_head
 
-                    self.process_log_entry(line)
+                line = log_file.readline()
+
+                if not line:
+                    time.sleep(poll_interval)
+                    continue
+
+                if not line.endswith("\n"):
+                    # Incomplete write: keep it and wait for the terminator.
+                    buffer += line
+                    continue
+
+                if buffer:
+                    line = buffer + line
+                    buffer = ""
+
+                self.process_log_entry(line)
 
         except KeyboardInterrupt:
             print("\n[*] Sentinel monitoring terminated by operator command execution.")
         except Exception as general_fault:
             print(f"[!] Unhandled operational layer engine crash encountered: {general_fault}", file=sys.stderr)
+        finally:
+            log_file.close()
 
     def _current_inode(self):
         """Return the inode backing the monitored path, or None if unavailable."""
         try:
             stat_result = os.stat(self.target_log_path)
-            # Windows has no stable inode; fall back to the size/mtime pair.
             return (stat_result.st_ino, stat_result.st_dev)
+        except OSError:
+            return None
+
+    def _current_size(self) -> int:
+        """Return the current byte length of the monitored path, or None."""
+        try:
+            return os.stat(self.target_log_path).st_size
+        except OSError:
+            return None
+
+    def _head_fingerprint(self):
+        """Return the first bytes of the monitored path, or None if unreadable.
+
+        Read through a throwaway handle so the tailer's own read offset is
+        never disturbed.
+        """
+        try:
+            with open(self.target_log_path, "rb") as probe:
+                return probe.read(HEAD_FINGERPRINT_BYTES)
         except OSError:
             return None
 
@@ -173,7 +260,11 @@ if __name__ == "__main__":
     # regardless of which directory it is launched from.
     REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     MOCK_LOG = os.environ.get("AAIDD_LOG_PATH", os.path.join(REPO_ROOT, "auth.log"))
-    OUTPUT_METRICS = os.path.join(REPO_ROOT, "telemetry_siem", "sample_alerts.json")
+    # Live alerts are written separately from the committed fixture, so running
+    # the defender never dirties or corrupts telemetry_siem/sample_alerts.json.
+    OUTPUT_METRICS = os.environ.get(
+        "AAIDD_OUTPUT_PATH", os.path.join(REPO_ROOT, "telemetry_siem", "alert_live.json")
+    )
 
     # Pre-flight confirmation initialization check
     if not os.path.exists(MOCK_LOG):

@@ -112,8 +112,23 @@ python defender_engine/log_sentinel.py
 ```
 
 Tails `auth.log` (override with `AAIDD_LOG_PATH`) and appends JSONL alerts to
-`telemetry_siem/alert_live.json`. The tail loop buffers partial lines and
-reopens the file automatically on rotation.
+`telemetry_siem/alert_live.json` (override with `AAIDD_OUTPUT_PATH`). The tail
+loop buffers partial lines and handles log rotation.
+
+Rotation is detected two ways, because `copytruncate` — the default mode for
+many `logrotate` configurations — empties the file *in place* and so leaves the
+inode unchanged:
+
+- **inode change** — a rename-and-recreate rotation, handled by reopening the
+  file.
+- **the head of the file changed, or it shrank below the read offset** — an
+  in-place truncation, handled by rewinding to the start. The head check is
+  what catches the case where new lines are appended fast enough to push the
+  file back past the stale offset before the next poll, which a size
+  comparison alone would miss.
+
+Without the second check, every attack line written after a rotation goes
+unseen for the remaining lifetime of the process.
 
 Trigger defaults: **3 failures from one source within 10 seconds**.
 
@@ -151,6 +166,7 @@ Targets loopback only by default. See "Safety rails" below.
 | Variable | Used by | Purpose |
 | --- | --- | --- |
 | `AAIDD_LOG_PATH` | defender | Auth log to tail |
+| `AAIDD_OUTPUT_PATH` | defender | Where JSONL alerts are written. Defaults to `telemetry_siem/alert_live.json`, deliberately kept separate from the committed `sample_alerts.json` fixture so running the defender never dirties it |
 | `AAIDD_SWARM_SECRET` | swarm | Per-node HMAC signing key (required) |
 | `AAIDD_NODE_ID` | swarm | Node identity sent with every broadcast |
 | `AAIDD_REGISTRY_URL` | swarm | Blocklist registry endpoint |
@@ -188,10 +204,25 @@ snapshot of `environment_state`.
 python -m pytest tests -q
 ```
 
-31 tests covering log parsing, sliding-window alerting, burst de-duplication,
+38 tests covering log parsing, sliding-window alerting, burst de-duplication,
 alert re-arming, path-traversal containment in the fake shell, telemetry
 failure handling, and HMAC signing/verification. Runs fully offline — no SSH,
 no network.
+
+The rotation and telemetry-durability tests drive the real tail loop against a
+temporary log, and are regression tests for two defects that made the detector
+fail open:
+
+- **`copytruncate` dropped every alert.** The loop only detected rotation by
+  inode change. An in-place truncation preserves the inode, so after a
+  `logrotate` cycle the read offset stayed past the new end of file and no
+  subsequent attack was ever detected.
+- **A failed alert write was a permanent suppression.** The dedup flag was set
+  before the write was attempted, so an alert that could not be persisted was
+  announced to the console, stored nowhere, and never retried.
+
+Both are covered at two timings, with and without a gap between the truncate
+and the next write.
 
 ---
 
@@ -238,6 +269,16 @@ empty key still produces a valid signature that anyone could forge.
 
 * The sliding window is evaluated per source IP only; true distributed
   correlation across many low-volume IPs needs shared state or clustering.
+* The sliding window is measured on *ingestion* time (`time.time()`), not on
+  the timestamp parsed out of each log line. Backfilled or replayed log
+  segments therefore appear as a burst even when they span hours of real time.
+  Parsing the syslog timestamp and windowing on it would fix this.
+* `ip_state_history` never evicts keys, only the timestamps inside them. Over a
+  long-running deployment a rotating-IP flood grows the dict without bound.
+* The source-IP sanitiser strips everything that is not a digit or a dot, which
+  destroys IPv6 addresses and collapses distinct hostnames into one shared
+  bucket (`a.evil.example`, `b.evil.example` and `c.evil.example` all become
+  `".."`). `ipaddress.ip_address()` validation would fix this.
 * The shield `Failed password` regex covers the common `auth.log` formats but
   not journald output. A `journalctl -f` adapter would broaden coverage.
 * `threat_swarm` transport is functional but the registry API contract is
